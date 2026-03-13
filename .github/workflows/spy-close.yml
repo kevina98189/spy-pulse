@@ -52,24 +52,42 @@ jobs:
             print(json.dumps(data, indent=2))
             sys.exit(1)
 
-          # Get the most recent trading day
-          latest_date = sorted(ts.keys())[-1]
-          day_data    = ts[latest_date]
+          # Get the two most recent trading days
+          sorted_dates = sorted(ts.keys())
+          if len(sorted_dates) < 2:
+            print("ERROR: Not enough data to calculate prev close")
+            sys.exit(1)
 
-          open_price  = float(day_data['1. open'])
-          close_price = float(day_data['4. close'])
-          pct_change  = round((close_price - open_price) / open_price * 100, 4)
+          latest_date  = sorted_dates[-1]
+          prev_date    = sorted_dates[-2]
+          day_data     = ts[latest_date]
+          prev_data    = ts[prev_date]
 
-          print(f"Date:  {latest_date}")
-          print(f"Open:  {open_price}")
-          print(f"Close: {close_price}")
-          print(f"Move:  {pct_change:+.4f}%")
+          open_price   = float(day_data['1. open'])
+          close_price  = float(day_data['4. close'])
+          prev_close   = float(prev_data['4. close'])
+          pct_change   = round((close_price - prev_close) / prev_close * 100, 4)
+
+          if pct_change > 0.3:
+            result_direction = 'bull'
+          elif pct_change < -0.3:
+            result_direction = 'bear'
+          else:
+            result_direction = 'flat'
+
+          print(f"Date:      {latest_date}")
+          print(f"Prev close: {prev_close}")
+          print(f"Open:      {open_price}")
+          print(f"Close:     {close_price}")
+          print(f"Move:      {pct_change:+.4f}% ({result_direction})")
 
           # ── Insert into Supabase ─────────────────────────────
           payload = json.dumps({
-            "close_date":   latest_date,
-            "open_price":   open_price,
-            "close_price":  close_price
+            "close_date":        latest_date,
+            "open_price":        open_price,
+            "close_price":       close_price,
+            "pct_change":        pct_change,
+            "result_direction":  result_direction
           }).encode('utf-8')
 
           sb_req = urllib.request.Request(
