@@ -1,0 +1,96 @@
+name: Fetch SPY Close Price
+
+on:
+  schedule:
+    # Runs at 4:30pm ET (21:30 UTC) every weekday Mon-Fri
+    - cron: '30 21 * * 1-5'
+  workflow_dispatch: # allows manual trigger from GitHub UI
+
+jobs:
+  fetch-spy-close:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Fetch SPY close and insert into Supabase
+        env:
+          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python3 << 'EOF'
+          import urllib.request
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone, timedelta
+
+          ALPHA_KEY   = os.environ['ALPHA_VANTAGE_KEY']
+          SB_URL      = os.environ['SUPABASE_URL']
+          SB_KEY      = os.environ['SUPABASE_SERVICE_KEY']
+
+          # ── Get today's date in US Eastern time ──────────────
+          et = datetime.now(timezone(timedelta(hours=-4)))  # EDT (UTC-4)
+          today = et.strftime('%Y-%m-%d')
+          print(f"Fetching SPY close for {today}")
+
+          # ── Fetch from Alpha Vantage ─────────────────────────
+          url = (
+            f"https://www.alphavantage.co/query"
+            f"?function=TIME_SERIES_DAILY"
+            f"&symbol=SPY"
+            f"&outputsize=compact"
+            f"&apikey={ALPHA_KEY}"
+          )
+
+          req = urllib.request.Request(url)
+          with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode())
+
+          ts = data.get('Time Series (Daily)', {})
+          if not ts:
+            print("ERROR: No time series data returned from Alpha Vantage")
+            print(json.dumps(data, indent=2))
+            sys.exit(1)
+
+          # Get the most recent trading day
+          latest_date = sorted(ts.keys())[-1]
+          day_data    = ts[latest_date]
+
+          open_price  = float(day_data['1. open'])
+          close_price = float(day_data['4. close'])
+          pct_change  = round((close_price - open_price) / open_price * 100, 4)
+
+          print(f"Date:  {latest_date}")
+          print(f"Open:  {open_price}")
+          print(f"Close: {close_price}")
+          print(f"Move:  {pct_change:+.4f}%")
+
+          # ── Insert into Supabase ─────────────────────────────
+          payload = json.dumps({
+            "close_date":   latest_date,
+            "open_price":   open_price,
+            "close_price":  close_price
+          }).encode('utf-8')
+
+          sb_req = urllib.request.Request(
+            f"{SB_URL}/rest/v1/spy_closes",
+            data=payload,
+            headers={
+              'Content-Type':  'application/json',
+              'apikey':        SB_KEY,
+              'Authorization': f'Bearer {SB_KEY}',
+              'Prefer':        'resolution=merge-duplicates'
+            },
+            method='POST'
+          )
+
+          try:
+            with urllib.request.urlopen(sb_req) as sb_resp:
+              print(f"Supabase response: {sb_resp.status}")
+              print(f"Successfully inserted SPY close for {latest_date}")
+          except urllib.error.HTTPError as e:
+            print(f"Supabase error: {e.code} {e.reason}")
+            print(e.read().decode())
+            sys.exit(1)
+
+          EOF
