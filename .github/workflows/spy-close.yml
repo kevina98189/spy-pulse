@@ -4,14 +4,14 @@ on:
   schedule:
     # Runs at 4:30pm ET (21:30 UTC) every weekday Mon-Fri
     - cron: '30 21 * * 1-5'
-  workflow_dispatch: # allows manual trigger from GitHub UI
+  workflow_dispatch:
 
 jobs:
   fetch-spy-close:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Fetch SPY close and insert into Supabase
+      - name: Fetch SPY close and create daily snapshot
         env:
           ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -24,91 +24,82 @@ jobs:
           import sys
           from datetime import datetime, timezone, timedelta
 
-          ALPHA_KEY   = os.environ['ALPHA_VANTAGE_KEY']
-          SB_URL      = os.environ['SUPABASE_URL']
-          SB_KEY      = os.environ['SUPABASE_SERVICE_KEY']
+          ALPHA_KEY = os.environ['ALPHA_VANTAGE_KEY']
+          SB_URL    = os.environ['SUPABASE_URL']
+          SB_KEY    = os.environ['SUPABASE_SERVICE_KEY']
 
-          # ── Get today's date in US Eastern time ──────────────
-          et = datetime.now(timezone(timedelta(hours=-4)))  # EDT (UTC-4)
+          et = datetime.now(timezone(timedelta(hours=-4)))
           today = et.strftime('%Y-%m-%d')
-          print(f"Fetching SPY close for {today}")
+          print(f"Processing {today}")
 
-          # ── Fetch from Alpha Vantage ─────────────────────────
-          url = (
-            f"https://www.alphavantage.co/query"
-            f"?function=TIME_SERIES_DAILY"
-            f"&symbol=SPY"
-            f"&outputsize=compact"
-            f"&apikey={ALPHA_KEY}"
-          )
+          headers = {
+            'Content-Type':  'application/json',
+            'apikey':        SB_KEY,
+            'Authorization': f'Bearer {SB_KEY}'
+          }
 
+          def sb_post(path, payload, prefer=None):
+            h = dict(headers)
+            if prefer: h['Prefer'] = prefer
+            req = urllib.request.Request(
+              f"{SB_URL}/rest/v1/{path}",
+              data=json.dumps(payload).encode('utf-8'),
+              headers=h, method='POST'
+            )
+            try:
+              with urllib.request.urlopen(req) as r:
+                print(f"  POST {path}: {r.status}")
+                return True
+            except urllib.error.HTTPError as e:
+              print(f"  POST {path} error: {e.code} {e.read().decode()}")
+              return False
+
+          def sb_get(path):
+            req = urllib.request.Request(f"{SB_URL}/rest/v1/{path}", headers=headers)
+            with urllib.request.urlopen(req) as r:
+              return json.loads(r.read().decode())
+
+          # Step 1: Snapshot 4am-4pm ET votes
+          print("Creating daily snapshot...")
+          window_start = f"{today}T04:00:00-04:00"
+          window_end   = f"{today}T16:00:00-04:00"
+          votes = sb_get(f"votes?select=direction&voted_at=gte.{window_start}&voted_at=lte.{window_end}")
+          bull = sum(1 for v in votes if v['direction'] == 'bull')
+          bear = sum(1 for v in votes if v['direction'] == 'bear')
+          print(f"  bull={bull} bear={bear} total={bull+bear}")
+          sb_post('daily_snapshots',
+            {'snapshot_date': today, 'bull_count': bull, 'bear_count': bear},
+            'resolution=merge-duplicates')
+
+          # Step 2: Fetch SPY close
+          print("Fetching SPY price...")
+          url = (f"https://www.alphavantage.co/query"
+                 f"?function=TIME_SERIES_DAILY&symbol=SPY"
+                 f"&outputsize=compact&apikey={ALPHA_KEY}")
           req = urllib.request.Request(url)
           with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode())
 
           ts = data.get('Time Series (Daily)', {})
           if not ts:
-            print("ERROR: No time series data returned from Alpha Vantage")
-            print(json.dumps(data, indent=2))
-            sys.exit(1)
+            print("ERROR: No data"); print(json.dumps(data)); sys.exit(1)
 
-          # Get the two most recent trading days
           sorted_dates = sorted(ts.keys())
-          if len(sorted_dates) < 2:
-            print("ERROR: Not enough data to calculate prev close")
-            sys.exit(1)
-
           latest_date  = sorted_dates[-1]
           prev_date    = sorted_dates[-2]
-          day_data     = ts[latest_date]
-          prev_data    = ts[prev_date]
-
-          open_price   = float(day_data['1. open'])
-          close_price  = float(day_data['4. close'])
-          prev_close   = float(prev_data['4. close'])
+          open_price   = float(ts[latest_date]['1. open'])
+          close_price  = float(ts[latest_date]['4. close'])
+          prev_close   = float(ts[prev_date]['4. close'])
           pct_change   = round((close_price - prev_close) / prev_close * 100, 4)
+          result_dir   = 'bull' if pct_change > 0.3 else ('bear' if pct_change < -0.3 else 'flat')
 
-          if pct_change > 0.3:
-            result_direction = 'bull'
-          elif pct_change < -0.3:
-            result_direction = 'bear'
-          else:
-            result_direction = 'flat'
+          print(f"  {latest_date}: {prev_close} → {close_price} ({pct_change:+.4f}% {result_dir})")
 
-          print(f"Date:      {latest_date}")
-          print(f"Prev close: {prev_close}")
-          print(f"Open:      {open_price}")
-          print(f"Close:     {close_price}")
-          print(f"Move:      {pct_change:+.4f}% ({result_direction})")
+          sb_post('spy_closes', {
+            'close_date': latest_date, 'open_price': open_price,
+            'close_price': close_price, 'pct_change': pct_change,
+            'result_direction': result_dir
+          }, 'resolution=merge-duplicates')
 
-          # ── Insert into Supabase ─────────────────────────────
-          payload = json.dumps({
-            "close_date":        latest_date,
-            "open_price":        open_price,
-            "close_price":       close_price,
-            "pct_change":        pct_change,
-            "result_direction":  result_direction
-          }).encode('utf-8')
-
-          sb_req = urllib.request.Request(
-            f"{SB_URL}/rest/v1/spy_closes",
-            data=payload,
-            headers={
-              'Content-Type':  'application/json',
-              'apikey':        SB_KEY,
-              'Authorization': f'Bearer {SB_KEY}',
-              'Prefer':        'resolution=merge-duplicates'
-            },
-            method='POST'
-          )
-
-          try:
-            with urllib.request.urlopen(sb_req) as sb_resp:
-              print(f"Supabase response: {sb_resp.status}")
-              print(f"Successfully inserted SPY close for {latest_date}")
-          except urllib.error.HTTPError as e:
-            print(f"Supabase error: {e.code} {e.reason}")
-            print(e.read().decode())
-            sys.exit(1)
-
+          print("Done!")
           EOF
